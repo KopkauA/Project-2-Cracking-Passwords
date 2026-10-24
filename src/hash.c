@@ -1,3 +1,19 @@
+/*
+
+REQUIREMENTS:
+- Change the code in the file hash.c to make it faster using threads without changing the correct output. 
+- You cannot modify other files (main.c, hash.h, hash_functions.c, hash_functions.h, Makefile). 
+- You are only allowed to use:
+	1. The pthread and semaphore libraries (and other standard C libraries), 
+	2. Your knowledge of algorithms and data structures
+	3. Your C coding skills
+- Using non-standard libraries, changing compiler flags, and other tricks are not allowed. 
+- If, at any point in time, your program has more than 12 threads (including the main thread) in execution, your submission will be deemed invalid. 
+- In other words, your process cannot have more than 12 threads running simultaneously.
+
+*/
+
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
