@@ -1,7 +1,7 @@
 # Project 2: Multithreaded Password Cracker
 
 **Group:** Group #16
-**Members:** Aubrey Kopkau (U12459434), [Name 2 (UID)], [Name 3 (UID)], [Name 4 (UID)]
+**Members:** Aubrey Kopkau (U12459434), Chloe Robinson (U17294327), [Name 3 (UID)], [Name 4 (UID)]
 
 ## Overview
 
