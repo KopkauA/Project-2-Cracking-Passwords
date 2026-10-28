@@ -19,32 +19,54 @@ REQUIREMENTS:
 #include <stdlib.h>
 #include <assert.h>
 
-#include "hash_functions.h"
-
 //Added allowed libraries
 #include <pthread.h>
 #include <semaphore.h>
 
-#define KEEP 16 // only the first 16 bytes of a hash are kept
+#include "hash_functions.h"
 
+#define KEEP 16 // only the first 16 bytes of a hash are kept
 #define MAX_WORKERS 8 // 8 threads to calculate hash passwords
-#define HASH_BUCKETS 65536 //
+#define HASH_BUCKETS 65536 // 2^16 buckets for hash table
+#define CHUNK_SIZE 64 // 64 passwords at once
+
+//ADDED: helper functions for hashing and comparing hashes
+/* Helper to convert a single hex character to its 4-bit nibble */
+static inline int hex_char_to_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+/* Converts a 32-character hex string into 16 raw binary bytes */
+static void hex_to_bin(const char *hex, unsigned char *bin) {
+    for (int i = 0; i < KEEP; i++) {
+        bin[i] = (unsigned char)((hex_char_to_val(hex[2 * i]) << 4) |
+                                 hex_char_to_val(hex[2 * i + 1]));
+    }
+}
+
+/* Fast bucket indexing: use the first 2 raw bytes (16 bits) directly */
+static inline size_t hash_bin(const unsigned char *b) {
+    return (((size_t)b[0] << 8) | (size_t)b[1]) % HASH_BUCKETS;
+}
 
 struct cracked_hash {
-	char hash[2*KEEP+1];
+	unsigned char bin_hash[KEEP];
 	char *password, *alg;
 };
 
 typedef unsigned char * (*hashing)(unsigned char *, unsigned int);
 
-int n_algs = 4;
-hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
-char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
+static const int n_algs = 4;
+static hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
+static char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
 
 //Added
 struct password_record {
     char password[256];
-    char hashes[4][2 * KEEP + 1];
+    unsigned char hashes[4][KEEP];
 };
 
 struct worker_data {
@@ -65,28 +87,37 @@ static void *hash_worker(void *arg) {
             break;
         }
 
-        size_t index = data->next++;
+        size_t start = data->next;
+		size_t end = start + CHUNK_SIZE;
+		if (end > data->count){
+			end = data->count;
+		}
+
+		data->next = end;
         pthread_mutex_unlock(&data->mutex);
 
-        struct password_record *record = &data->records[index];
-        unsigned int len = (unsigned int)strlen(record->password);
+		for (size_t index = start; index < end; index++) {
 
-        for (int i = 0; i < n_algs; i++) {
-            unsigned char *hash = fn[i](
-                (unsigned char *)record->password, len
-            );
+			struct password_record *record = &data->records[index];
+			unsigned int len = (unsigned int)strlen(record->password);
 
-            for (int j = 0; j < KEEP; j++)
-                sprintf(&record->hashes[i][2 * j], "%02x", hash[j]);
+			for (int i = 0; i < n_algs; i++) {
+				unsigned char *hash = fn[i](
+					(unsigned char *)record->password, len
+				);
 
-            record->hashes[i][2 * KEEP] = '\0';
-            free(hash);
-        }
+				//copy first 16 bytes directly (no sprintf)
+				memcpy(record->hashes[i], hash, KEEP);
+
+				free(hash);
+			}
+		}
     }
 
     return NULL;
 }
 
+// DEAD CODE: function not being used 10/27 - Aubrey
 static size_t hash_key(const char *s) {
     size_t h = 5381;
 
@@ -96,6 +127,7 @@ static size_t hash_key(const char *s) {
     return h % HASH_BUCKETS;
 }
 
+// DEAD CODE: function not being used 10/27 - Aubrey
 int compare_hashes(char *a, char *b) {
 	for(int i=0; i < 2*KEEP; i++)
 		if(a[i] != b[i])
@@ -112,49 +144,27 @@ int compare_hashes(char *a, char *b) {
 void crack_hashed_passwords(char *password_list, char *hashed_list, char *output) {
 	FILE *fp;
 	char password[256];  // passwords have at most 255 characters
-	char hex_hash[2*KEEP+1]; // hashed passwords have at most 'keep' characters
+	char hex_hash[256]; // hashed passwords have at most 256 characters
 
 	// load hashed passwords
 	int n_hashed = 0;
 	struct cracked_hash *cracked_hashes;
 	fp = fopen(hashed_list, "r");
 	assert(fp != NULL);
-	while(fscanf(fp, "%s", hex_hash) == 1)
+	while(fscanf(fp, "%255s", hex_hash) == 1)
 		n_hashed++;
 	rewind(fp);
+
 	cracked_hashes = (struct cracked_hash *) malloc(n_hashed*sizeof(struct cracked_hash));
 	assert(n_hashed == 0 || cracked_hashes != NULL);
 	for(int i=0; i < n_hashed; i++) {
-		fscanf(fp, "%s", cracked_hashes[i].hash);
+		fscanf(fp, "%255s", hex_hash);
+		hex_to_bin(hex_hash, cracked_hashes[i].bin_hash);
 		cracked_hashes[i].password = NULL;
 		cracked_hashes[i].alg = NULL;
 	}
 	fclose(fp);
 
-	//////////////Modified Section
-	// load common passwords, hash them, and compare them to hashed passwords
-	/*fp = fopen(password_list, "r");
-	assert(fp != NULL);
-	while(fscanf(fp, "%s", password) == 1) {
-
-		for(int i=0; i < n_algs; i++) {
-			unsigned char *hash = fn[i]((unsigned char *)password, strlen(password));
-			for(int j=0; j < KEEP; j++)
-				sprintf(&hex_hash[2*j], "%02x", hash[j]);
-			hex_hash[2*KEEP] = '\0';
-			for(int j=0; j < n_hashed; j++) {
-				if(cracked_hashes[j].password !=  NULL)
-					continue;
-				if(compare_hashes(hex_hash, cracked_hashes[j].hash)) {
-					cracked_hashes[j].password = strdup(password);
-					cracked_hashes[j].alg = algs[i];
-					break;
-				}
-			}
-			free(hash);
-		}
-	}
-	fclose(fp);*/
 
 	/*Hash Table Mapping Target digest to target indicies
 	Chain to preserve duplicate target hashes
@@ -169,7 +179,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
         heads[b] = (size_t)-1;
 
     for (int i = n_hashed - 1; i >= 0; i--) {
-        size_t b = hash_key(cracked_hashes[i].hash);
+        size_t b = hash_bin(cracked_hashes[i].bin_hash);
         next[i] = heads[b];
         heads[b] = (size_t)i;
     }
@@ -203,7 +213,11 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
         .count = count,
         .next = 0
     };
-    assert(pthread_mutex_init(&data.mutex, NULL) == 0);
+
+	// initialize mutex
+    int rc = pthread_mutex_init(&data.mutex, NULL);
+	assert(rc == 0);
+	(void)rc; // stops compiler warning about unused variable
 
     pthread_t threads[MAX_WORKERS];
     int created = 0;
@@ -229,20 +243,18 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
      */
     for (size_t p = 0; p < count; p++) {
         for (int a = 0; a < n_algs; a++) {
-            char *digest = records[p].hashes[a];
-            size_t b = hash_key(digest);
+            unsigned char *bin_digest = records[p].hashes[a];
+
+            size_t b = hash_bin(bin_digest);
 
             for (size_t j = heads[b]; j != (size_t)-1; j = next[j]) {
                 if (cracked_hashes[j].password != NULL)
                     continue;
 
-                if (compare_hashes(digest, cracked_hashes[j].hash)) {
-                    cracked_hashes[j].password =
-                        strdup(records[p].password);
+				if (memcmp(bin_digest, cracked_hashes[j].bin_hash, KEEP) == 0) {
+                    cracked_hashes[j].password = strdup(records[p].password);
                     assert(cracked_hashes[j].password != NULL);
-
                     cracked_hashes[j].alg = algs[a];
-                    break;
                 }
             }
         }
