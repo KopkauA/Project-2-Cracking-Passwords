@@ -78,11 +78,11 @@ static const int n_algs = 4;
 static hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
 static char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
 
-struct worker_data {
-    char (*passwords)[256];
-    size_t count;
-    size_t next_idx;
-    pthread_mutex_t queue_mutex;
+struct stream_context {
+    FILE *fp_passwords;
+    pthread_mutex_t file_mutex;
+    size_t current_idx;
+    int eof_reached;
 
     struct cracked_hash *cracked;
     int n_hashed;
@@ -94,35 +94,47 @@ struct worker_data {
 };
 
 static void *hash_worker(void *arg) {
-    struct worker_data *data = (struct worker_data *)arg;
+    struct stream_context *ctx = (struct stream_context *)arg;
+    char local_passwords[CHUNK_SIZE][256];
+    size_t local_indices[CHUNK_SIZE];
 
     while (1) {
         // Early exit: stop immediately if all targets have been solved
-        pthread_mutex_lock(&data->count_mutex);
-        if (data->remaining_unfound <= 0) {
-            pthread_mutex_unlock(&data->count_mutex);
+        pthread_mutex_lock(&ctx->count_mutex);
+        if (ctx->remaining_unfound <= 0) {
+            pthread_mutex_unlock(&ctx->count_mutex);
             break;
         }
-        pthread_mutex_unlock(&data->count_mutex);
+        pthread_mutex_unlock(&ctx->count_mutex);
 
-        // Dynamically claim next batch of passwords
-        pthread_mutex_lock(&data->queue_mutex);
-        if (data->next_idx >= data->count) {
-            pthread_mutex_unlock(&data->queue_mutex);
+        // Read next dynamic batch directly from file (streaming)
+        pthread_mutex_lock(&ctx->file_mutex);
+        if (ctx->eof_reached) {
+            pthread_mutex_unlock(&ctx->file_mutex);
             break;
         }
 
-        size_t start = data->next_idx;
-        size_t end = start + CHUNK_SIZE;
-        if (end > data->count) {
-            end = data->count;
+        int count = 0;
+        size_t base_idx = ctx->current_idx;
+        while (count < CHUNK_SIZE && fscanf(ctx->fp_passwords, "%255s", local_passwords[count]) == 1) {
+            local_indices[count] = base_idx + count;
+            count++;
         }
-        data->next_idx = end;
-        pthread_mutex_unlock(&data->queue_mutex);
+        ctx->current_idx += count;
 
-        // Compute hash and check table immediately in parallel
-        for (size_t index = start; index < end; index++) {
-            char *pwd = data->passwords[index];
+        if (count < CHUNK_SIZE) {
+            ctx->eof_reached = 1;
+        }
+        pthread_mutex_unlock(&ctx->file_mutex);
+
+        if (count == 0) {
+            break;
+        }
+
+        // Hash and match immediately in parallel
+        for (int p = 0; p < count; p++) {
+            char *pwd = local_passwords[p];
+            size_t idx = local_indices[p];
             unsigned int len = (unsigned int)strlen(pwd);
 
             for (int i = 0; i < n_algs; i++) {
@@ -131,25 +143,24 @@ static void *hash_worker(void *arg) {
 
                 size_t b = hash_bin(hash);
 
-                for (size_t j = data->heads[b]; j != (size_t)-1; j = data->next[j]) {
-                    struct cracked_hash *target = &data->cracked[j];
+                for (size_t j = ctx->heads[b]; j != (size_t)-1; j = ctx->next[j]) {
+                    struct cracked_hash *target = &ctx->cracked[j];
 
                     if (memcmp(hash, target->bin_hash, KEEP) == 0) {
                         pthread_mutex_lock(&target->lock);
                         if (target->password == NULL) {
                             target->password = strdup(pwd);
                             target->alg = algs[i];
-                            target->found_idx = index;
+                            target->found_idx = idx;
 
-                            pthread_mutex_lock(&data->count_mutex);
-                            data->remaining_unfound--;
-                            pthread_mutex_unlock(&data->count_mutex);
-                        } else if (index < target->found_idx) {
-                            // Enforce first-occurrence rule if chunks completed out of order
+                            pthread_mutex_lock(&ctx->count_mutex);
+                            ctx->remaining_unfound--;
+                            pthread_mutex_unlock(&ctx->count_mutex);
+                        } else if (idx < target->found_idx) {
                             free(target->password);
                             target->password = strdup(pwd);
                             target->alg = algs[i];
-                            target->found_idx = index;
+                            target->found_idx = idx;
                         }
                         pthread_mutex_unlock(&target->lock);
                     }
@@ -163,27 +174,28 @@ static void *hash_worker(void *arg) {
     return NULL;
 }
 
-///MODIFIED FUNCTION TO USE 11 THREADS///
-// Function name: crack_hashed_passwords
-// Description:   Computes different hashes for each password in the password list,
-//                then compare them to the hashed passwords to decide whether if
-//                any of them matches this password. When multiple passwords match
-//                the same hash, only the first one in the list is printed.
+/*
+    Function: crack_hashed_passwords
+    Parameters: 
+        password_list:
+        harshed_list:
+        output:
+*/
 void crack_hashed_passwords(char *password_list, char *hashed_list, char *output) {
-	FILE *fp;
-	char password[256];  // passwords have at most 255 characters
-	char hex_hash[256]; // hashed passwords have at most 256 characters
+    FILE *fp;
+    char hex_hash[256];
 
-	// load hashed passwords
-	int n_hashed = 0;
-	fp = fopen(hashed_list, "r");
-	assert(fp != NULL);
-	while(fscanf(fp, "%255s", hex_hash) == 1)
-		n_hashed++;
-	rewind(fp);
+    // 1. Load hashed passwords
+    int n_hashed = 0;
+    fp = fopen(hashed_list, "r");
+    assert(fp != NULL);
+    while (fscanf(fp, "%255s", hex_hash) == 1)
+        n_hashed++;
+    rewind(fp);
 
-    struct cracked_hash *cracked_hashes = malloc(n_hashed * sizeof(struct cracked_hash));	assert(n_hashed == 0 || cracked_hashes != NULL);
-	for (int i = 0; i < n_hashed; i++) {
+    struct cracked_hash *cracked_hashes = malloc(n_hashed * sizeof(struct cracked_hash));
+    assert(n_hashed == 0 || cracked_hashes != NULL);
+    for (int i = 0; i < n_hashed; i++) {
         fscanf(fp, "%255s", hex_hash);
         hex_to_bin(hex_hash, cracked_hashes[i].bin_hash);
         cracked_hashes[i].password = NULL;
@@ -193,17 +205,13 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     }
     fclose(fp);
 
-
-	/*Hash Table Mapping Target digest to target indicies
-	Chain to preserve duplicate target hashes
-	*/
-	size_t *heads = malloc(HASH_BUCKETS * sizeof(*heads));
+    // Hash Table Mapping Target digest to target indices
+    size_t *heads = malloc(HASH_BUCKETS * sizeof(*heads));
     size_t *next = malloc((size_t)n_hashed * sizeof(*next));
+    assert(heads != NULL);
+    assert(n_hashed == 0 || next != NULL);
 
-	assert(heads!=NULL);
-	assert(n_hashed == 0||next!=NULL);
-
-	for (size_t b = 0; b < HASH_BUCKETS; b++)
+    for (size_t b = 0; b < HASH_BUCKETS; b++)
         heads[b] = (size_t)-1;
 
     for (int i = n_hashed - 1; i >= 0; i--) {
@@ -212,30 +220,16 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
         heads[b] = (size_t)i;
     }
 
-    /* Load passwords in their original order. */
-    size_t count = 0, capacity = 4096;
-    char (*passwords)[256] = malloc(capacity * sizeof(*passwords));
-    assert(passwords != NULL);
+    // Open password file for parallel streaming (no giant array in memory)
+    FILE *fp_passwords = fopen(password_list, "r");
+    assert(fp_passwords != NULL);
+    setvbuf(fp_passwords, NULL, _IOFBF, 64 * 1024);
 
-    fp = fopen(password_list, "r");
-    assert(fp != NULL);
-
-    while (fscanf(fp, "%255s", passwords[count]) == 1) {
-        count++;
-        if (count == capacity) {
-            capacity *= 2;
-            char (*tmp)[256] = realloc(passwords, capacity * sizeof(*passwords));
-            assert(tmp != NULL);
-            passwords = tmp;
-        }
-    }
-    fclose(fp);
-
-    /* Hash passwords concurrently: at most 9 threads in total. */
-    struct worker_data data = {
-        .passwords = passwords,
-        .count = count,
-        .next_idx = 0,
+    // Initialize streaming synchronization context
+    struct stream_context ctx = {
+        .fp_passwords = fp_passwords,
+        .current_idx = 0,
+        .eof_reached = 0,
         .cracked = cracked_hashes,
         .n_hashed = n_hashed,
         .heads = heads,
@@ -243,25 +237,27 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
         .remaining_unfound = n_hashed
     };
 
-    pthread_mutex_init(&data.queue_mutex, NULL);
-    pthread_mutex_init(&data.count_mutex, NULL);
+    pthread_mutex_init(&ctx.file_mutex, NULL);
+    pthread_mutex_init(&ctx.count_mutex, NULL);
 
     pthread_t threads[MAX_WORKERS];
     int created = 0;
 
-    for (int i = 0; i < MAX_WORKERS && (size_t)i < count; i++) {
-        if (pthread_create(&threads[created], NULL, hash_worker, &data) != 0)
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (pthread_create(&threads[created], NULL, hash_worker, &ctx) != 0)
             break;
         created++;
     }
 
-    /* Main thread helps process remaining passwords. */
-    hash_worker(&data);
+    // Main thread helps process chunks (11 workers + 1 main thread = 12 total threads)
+    hash_worker(&ctx);
 
     for (int i = 0; i < created; i++)
         pthread_join(threads[i], NULL);
 
-	// print results
+    fclose(fp_passwords);
+
+    // Print results in original target hash order
     fp = fopen(output, "w");
     assert(fp != NULL);
     for (int i = 0; i < n_hashed; i++) {
@@ -271,10 +267,10 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
             fprintf(fp, "%s:%s\n", cracked_hashes[i].password, cracked_hashes[i].alg);
     }
     fclose(fp);
-	
-	//Free resources
-    pthread_mutex_destroy(&data.queue_mutex);
-    pthread_mutex_destroy(&data.count_mutex);
+
+    // Free resources
+    pthread_mutex_destroy(&ctx.file_mutex);
+    pthread_mutex_destroy(&ctx.count_mutex);
 
     for (int i = 0; i < n_hashed; i++) {
         free(cracked_hashes[i].password);
@@ -283,7 +279,5 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
 
     free(next);
     free(heads);
-    free(passwords);
     free(cracked_hashes);
 }
-
