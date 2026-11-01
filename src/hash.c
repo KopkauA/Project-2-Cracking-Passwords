@@ -59,6 +59,7 @@ struct cracked_hash {
 
 typedef unsigned char * (*hashing)(unsigned char *, unsigned int);
 
+//4 hashing algorithms used to calculate
 static const int n_algs = 4;
 static hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
 static char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
@@ -78,7 +79,8 @@ struct worker_data {
 
 static void *hash_worker(void *arg) {
     struct worker_data *data = arg;
-
+	
+//makes sure that no race condition occur due to processes processing chunks at the same time
     while (1) {
         pthread_mutex_lock(&data->mutex);
 
@@ -94,7 +96,7 @@ static void *hash_worker(void *arg) {
 		}
 
 		data->next = end;
-        pthread_mutex_unlock(&data->mutex);
+        pthread_mutex_unlock(&data->mutex); //unlocks after chunk is assigned 
 
 		for (size_t index = start; index < end; index++) {
 
@@ -222,6 +224,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     pthread_t threads[MAX_WORKERS];
     int created = 0;
 
+	//allows multithreading to calculate passwords concurrently (parallelism)
     for (int i = 0; i < MAX_WORKERS && (size_t)i < count; i++) {
         if (pthread_create(&threads[created], NULL,
                            hash_worker, &data) != 0)
@@ -232,7 +235,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     /* Main thread helps process remaining passwords. */
     hash_worker(&data);
 
-    for (int i = 0; i < created; i++)
+    for (int i = 0; i < created; i++) //waits for each worker to finish before matching
         pthread_join(threads[i], NULL);
 
     pthread_mutex_destroy(&data.mutex);
