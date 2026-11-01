@@ -15,7 +15,7 @@ REQUIREMENTS:
 
 /*
 Group: Group #16
-Members: Aubrey Kopkau (U12459434), Chloe Robinson (U17294327), [Name 3 (UID)], [Name 4 (UID)]
+Members: Aubrey Kopkau (U12459434), Chloe Robinson (U17294327),  Brianna Figueroa (U04033024), Paola Ferrigno (U92297671)
 Description: Modification of hash.c to improve password cracking performance while preserving correct output and original password and algorithm ordering. 
 Improvements made include:
     Computing MD5, SHA1, SHA256 and SHA512 concurrently across password recordings
