@@ -74,6 +74,7 @@ struct cracked_hash {
 
 typedef unsigned char * (*hashing)(unsigned char *, unsigned int);
 
+//4 hashing algorithms used to calculate
 static const int n_algs = 4;
 static hashing fn[4] = {calculate_md5, calculate_sha1, calculate_sha256, calculate_sha512};
 static char *algs[4] = {"MD5", "SHA1", "SHA256", "SHA512"};
@@ -94,10 +95,9 @@ struct stream_context {
 };
 
 static void *hash_worker(void *arg) {
-    struct stream_context *ctx = (struct stream_context *)arg;
-    char local_passwords[CHUNK_SIZE][256];
-    size_t local_indices[CHUNK_SIZE];
-
+    struct worker_data *data = arg;
+	
+//makes sure that no race condition occur due to processes processing chunks at the same time
     while (1) {
         // Early exit: stop immediately if all targets have been solved
         pthread_mutex_lock(&ctx->count_mutex);
@@ -107,12 +107,14 @@ static void *hash_worker(void *arg) {
         }
         pthread_mutex_unlock(&ctx->count_mutex);
 
-        // Read next dynamic batch directly from file (streaming)
-        pthread_mutex_lock(&ctx->file_mutex);
-        if (ctx->eof_reached) {
-            pthread_mutex_unlock(&ctx->file_mutex);
-            break;
-        }
+        size_t start = data->next;
+		size_t end = start + CHUNK_SIZE;
+		if (end > data->count){
+			end = data->count;
+		}
+
+		data->next = end;
+        pthread_mutex_unlock(&data->mutex); //unlocks after chunk is assigned 
 
         int count = 0;
         size_t base_idx = ctx->current_idx;
@@ -243,8 +245,10 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     pthread_t threads[MAX_WORKERS];
     int created = 0;
 
-    for (int i = 0; i < MAX_WORKERS; i++) {
-        if (pthread_create(&threads[created], NULL, hash_worker, &ctx) != 0)
+	//allows multithreading to calculate passwords concurrently (parallelism)
+    for (int i = 0; i < MAX_WORKERS && (size_t)i < count; i++) {
+        if (pthread_create(&threads[created], NULL,
+                           hash_worker, &data) != 0)
             break;
         created++;
     }
@@ -252,7 +256,7 @@ void crack_hashed_passwords(char *password_list, char *hashed_list, char *output
     // Main thread helps process chunks (11 workers + 1 main thread = 12 total threads)
     hash_worker(&ctx);
 
-    for (int i = 0; i < created; i++)
+    for (int i = 0; i < created; i++) //waits for each worker to finish before matching
         pthread_join(threads[i], NULL);
 
     fclose(fp_passwords);
